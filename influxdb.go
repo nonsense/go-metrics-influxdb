@@ -3,33 +3,37 @@ package influxdb
 import (
 	"fmt"
 	"log"
+	"math"
 	uurl "net/url"
+	"sort"
 	"time"
 
 	"github.com/influxdata/influxdb/client"
-	"github.com/rcrowley/go-metrics"
 )
 
 type reporter struct {
 	reg      metrics.Registry
 	interval time.Duration
 
-	url      uurl.URL
-	database string
-	username string
-	password string
-	tags     map[string]string
+	url       uurl.URL
+	database  string
+	username  string
+	password  string
+	namespace string
+	tags      map[string]string
 
 	client *client.Client
+
+	cache map[string]int64
 }
 
-// InfluxDB starts a InfluxDB reporter which will post the metrics from the given registry at each d interval.
-func InfluxDB(r metrics.Registry, d time.Duration, url, database, username, password string) {
-	InfluxDBWithTags(r, d, url, database, username, password, nil)
+// InfluxDB starts a InfluxDB reporter which will post the from the given metrics.Registry at each d interval.
+func InfluxDB(r metrics.Registry, d time.Duration, url, database, username, password, namespace string) {
+	InfluxDBWithTags(r, d, url, database, username, password, namespace, nil)
 }
 
-// InfluxDBWithTags starts a InfluxDB reporter which will post the metrics from the given registry at each d interval with the specified tags
-func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, username, password string, tags map[string]string) {
+// InfluxDBWithTags starts a InfluxDB reporter which will post the from the given metrics.Registry at each d interval with the specified tags
+func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, username, password, namespace string, tags map[string]string) {
 	u, err := uurl.Parse(url)
 	if err != nil {
 		log.Printf("unable to parse InfluxDB url %s. err=%v", url, err)
@@ -37,13 +41,15 @@ func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, userna
 	}
 
 	rep := &reporter{
-		reg:      r,
-		interval: d,
-		url:      *u,
-		database: database,
-		username: username,
-		password: password,
-		tags:     tags,
+		reg:       r,
+		interval:  d,
+		url:       *u,
+		database:  database,
+		username:  username,
+		password:  password,
+		namespace: namespace,
+		tags:      tags,
+		cache:     make(map[string]int64),
 	}
 	if err := rep.makeClient(); err != nil {
 		log.Printf("unable to make InfluxDB client. err=%v", err)
@@ -71,7 +77,7 @@ func (r *reporter) run() {
 		select {
 		case <-intervalTicker:
 			if err := r.send(); err != nil {
-				log.Printf("unable to send metrics to InfluxDB. err=%v", err)
+				log.Printf("unable to send to InfluxDB. err=%v", err)
 			}
 		case <-pingTicker:
 			_, _, err := r.client.Ping()
@@ -91,22 +97,25 @@ func (r *reporter) send() error {
 
 	r.reg.Each(func(name string, i interface{}) {
 		now := time.Now()
+		namespace := r.namespace
 
 		switch metric := i.(type) {
 		case metrics.Counter:
-			ms := metric.Snapshot()
+			v := metric.Count()
+			l := r.cache[name]
 			pts = append(pts, client.Point{
-				Measurement: fmt.Sprintf("%s.count", name),
+				Measurement: fmt.Sprintf("%s%s.count", namespace, name),
 				Tags:        r.tags,
 				Fields: map[string]interface{}{
-					"value": ms.Count(),
+					"value": v - l,
 				},
 				Time: now,
 			})
+			r.cache[name] = v
 		case metrics.Gauge:
 			ms := metric.Snapshot()
 			pts = append(pts, client.Point{
-				Measurement: fmt.Sprintf("%s.gauge", name),
+				Measurement: fmt.Sprintf("%s%s.gauge", namespace, name),
 				Tags:        r.tags,
 				Fields: map[string]interface{}{
 					"value": ms.Value(),
@@ -116,7 +125,7 @@ func (r *reporter) send() error {
 		case metrics.GaugeFloat64:
 			ms := metric.Snapshot()
 			pts = append(pts, client.Point{
-				Measurement: fmt.Sprintf("%s.gauge", name),
+				Measurement: fmt.Sprintf("%s%s.gauge", namespace, name),
 				Tags:        r.tags,
 				Fields: map[string]interface{}{
 					"value": ms.Value(),
@@ -127,7 +136,7 @@ func (r *reporter) send() error {
 			ms := metric.Snapshot()
 			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999, 0.9999})
 			pts = append(pts, client.Point{
-				Measurement: fmt.Sprintf("%s.histogram", name),
+				Measurement: fmt.Sprintf("%s%s.histogram", namespace, name),
 				Tags:        r.tags,
 				Fields: map[string]interface{}{
 					"count":    ms.Count(),
@@ -148,7 +157,7 @@ func (r *reporter) send() error {
 		case metrics.Meter:
 			ms := metric.Snapshot()
 			pts = append(pts, client.Point{
-				Measurement: fmt.Sprintf("%s.meter", name),
+				Measurement: fmt.Sprintf("%s%s.meter", namespace, name),
 				Tags:        r.tags,
 				Fields: map[string]interface{}{
 					"count": ms.Count(),
@@ -163,7 +172,7 @@ func (r *reporter) send() error {
 			ms := metric.Snapshot()
 			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999, 0.9999})
 			pts = append(pts, client.Point{
-				Measurement: fmt.Sprintf("%s.timer", name),
+				Measurement: fmt.Sprintf("%s%s.timer", namespace, name),
 				Tags:        r.tags,
 				Fields: map[string]interface{}{
 					"count":    ms.Count(),
@@ -185,6 +194,77 @@ func (r *reporter) send() error {
 				},
 				Time: now,
 			})
+		case metrics.ResettingTimer:
+			t := metric.Snapshot()
+			sort.Sort(Int64Slice(t.Values()))
+
+			val := t.Values()
+			count := len(val)
+			if count > 0 {
+				min := val[0]
+				max := val[count-1]
+
+				cumulativeValues := make([]int64, count)
+				cumulativeValues[0] = min
+				for i := 1; i < count; i++ {
+					cumulativeValues[i] = val[i] + cumulativeValues[i-1]
+				}
+
+				percentiles := map[string]float64{
+					"50": 50,
+					"95": 95,
+					"99": 99,
+				}
+
+				ps := []int64{}
+
+				thresholdBoundary := max
+
+				for _, pct := range percentiles {
+					if count > 1 {
+						var abs float64
+						if pct >= 0 {
+							abs = pct
+						} else {
+							abs = 100 + pct
+						}
+						// poor man's math.Round(x):
+						// math.Floor(x + 0.5)
+						indexOfPerc := int(math.Floor(((abs / 100.0) * float64(count)) + 0.5))
+						if pct >= 0 {
+							indexOfPerc -= 1 // index offset=0
+						}
+						thresholdBoundary = val[indexOfPerc]
+					}
+
+					if pct > 0 {
+						ps = append(ps, thresholdBoundary)
+						//fmt.Fprintf(w, "%s.%s.upper_%s %d %d\n", c.Prefix, name, k, thresholdBoundary, now)
+					} else {
+						ps = append(ps, thresholdBoundary)
+						//fmt.Fprintf(w, "%s.%s.lower_%s %d %d\n", c.Prefix, name, k, thresholdBoundary, now)
+					}
+				}
+
+				sum := cumulativeValues[count-1]
+				mean := float64(sum) / float64(count)
+
+				pts = append(pts, client.Point{
+					Measurement: fmt.Sprintf("%s%s.span", namespace, name),
+					Tags:        r.tags,
+					Fields: map[string]interface{}{
+						"count": count,
+						"max":   max,
+						"mean":  mean,
+						"min":   min,
+						"p50":   ps[0],
+						"p95":   ps[1],
+						"p99":   ps[2],
+					},
+					Time: now,
+				})
+			}
+
 		}
 	})
 
@@ -196,3 +276,10 @@ func (r *reporter) send() error {
 	_, err := r.client.Write(bps)
 	return err
 }
+
+// Int64Slice attaches the methods of sort.Interface to []int64, sorting in increasing order.
+type Int64Slice []int64
+
+func (s Int64Slice) Len() int           { return len(s) }
+func (s Int64Slice) Less(i, j int) bool { return s[i] < s[j] }
+func (s Int64Slice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
